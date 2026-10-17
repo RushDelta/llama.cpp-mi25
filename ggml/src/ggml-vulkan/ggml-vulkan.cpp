@@ -4020,6 +4020,20 @@ vk_device ggml_vk_get_device(size_t idx) {
         const char* GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM = getenv("GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM");
         device->disable_host_visible_vidmem = GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM != nullptr;
 
+        // GCN without resizable BAR: the host-visible VRAM heap is a small BAR window and GPU reads from it are slow
+        if (device->architecture == AMD_GCN && !device->disable_host_visible_vidmem) {
+            const vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
+            bool large_bar = false;
+            for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
+                const vk::MemoryPropertyFlags flags = mem_props.memoryTypes[i].propertyFlags;
+                if ((flags & vk::MemoryPropertyFlagBits::eDeviceLocal) && (flags & vk::MemoryPropertyFlagBits::eHostVisible) &&
+                    mem_props.memoryHeaps[mem_props.memoryTypes[i].heapIndex].size > 256ull * 1024 * 1024) {
+                    large_bar = true;
+                }
+            }
+            device->disable_host_visible_vidmem = !large_bar;
+        }
+
         const char* GGML_VK_ALLOW_SYSMEM_FALLBACK = getenv("GGML_VK_ALLOW_SYSMEM_FALLBACK");
         device->allow_sysmem_fallback = GGML_VK_ALLOW_SYSMEM_FALLBACK != nullptr;
 
