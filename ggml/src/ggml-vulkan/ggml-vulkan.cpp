@@ -1242,7 +1242,9 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
         if (result.row_split == 1) {
             result.block_rows = n_rows == 2 ? 2 : ((n_rows <= 4 || reduce_block_rows) ? 4 : 8);
         } else {
-            result.block_rows = n_rows <= 4 ? 4 : ((n_rows <= 8 || reduce_block_rows) ? 8 : 16);
+            // GCN: 16 rows spill registers, 8 rows is 5-10x faster (measured on gfx900, hsk 256)
+            const bool gcn_cap = device->architecture == AMD_GCN;
+            result.block_rows = n_rows <= 4 ? 4 : ((n_rows <= 8 || reduce_block_rows || gcn_cap) ? 8 : 16);
         }
 
         result.block_cols = (D & 8) ? 64 : 32;
