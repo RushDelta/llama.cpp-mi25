@@ -972,6 +972,9 @@ struct ggml_backend_sched {
     ggml_backend_sched_split_done_callback callback_split_done;
     void * callback_split_done_user_data;
 
+    ggml_backend_sched_input_alloc_callback callback_input_alloc;
+    void * callback_input_alloc_user_data;
+
     char * context_buffer;
     size_t context_buffer_size;
 
@@ -1209,6 +1212,8 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 }
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
+static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t);
+
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
     sched->n_splits = 0;
@@ -1531,6 +1536,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             }
                             tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
                             SET_CAUSE(tensor_copy, "4.cpy");
+                            if (sched->callback_input_alloc != NULL && sched->n_copies == 1 && ggml_backend_sched_is_host_weight(src)) {
+                                sched->callback_input_alloc(backend, src, tensor_copy, sched->callback_input_alloc_user_data);
+                            }
                         }
                         int n_inputs = split->n_inputs++;
                         if (n_inputs >= split->inputs_capacity) {
@@ -2153,6 +2161,12 @@ void ggml_backend_sched_set_split_done_callback(ggml_backend_sched_t sched, ggml
     GGML_ASSERT(sched);
     sched->callback_split_done = callback;
     sched->callback_split_done_user_data = user_data;
+}
+
+void ggml_backend_sched_set_input_alloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_input_alloc_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_input_alloc = callback;
+    sched->callback_input_alloc_user_data = user_data;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

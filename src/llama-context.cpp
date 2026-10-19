@@ -659,6 +659,7 @@ void llama_context::sched_reserve() {
     expert_prefetch_setup();
     if (prefetch.enabled) {
         ggml_backend_sched_set_split_done_callback(sched.get(), sched_split_done, this);
+        ggml_backend_sched_set_input_alloc_callback(sched.get(), sched_alloc_expert_copy, this);
     }
 
     llama_memory_context_ptr mctx;
@@ -702,6 +703,7 @@ void llama_context::sched_reserve() {
                 ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
                 if (prefetch.enabled) {
                     ggml_backend_sched_set_split_done_callback(sched.get(), sched_split_done, this);
+                    ggml_backend_sched_set_input_alloc_callback(sched.get(), sched_alloc_expert_copy, this);
                 }
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
@@ -2688,6 +2690,15 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         }
     }
 
+    // dst is bound to a slot, so the old path below overwrites it: the slot no longer holds a full layer
+    if (ep.enabled && ep.where.count(src)) {
+        const int s = ep.where[src].first % 2;
+        ep.slot_layer[s] = -1;
+        if (ep.slot_free_rec[s]) {
+            ggml_backend_event_wait(backend, ep.slot_free[s]);
+        }
+    }
+
     // the slot maps of the MoE cache
     if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
         return true;
@@ -2766,6 +2777,19 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         first = last + 1;
     }
 
+    return true;
+}
+
+// bind the device copy of a host expert tensor to its staging slot, so the graph allocator skips it
+bool llama_context::sched_alloc_expert_copy(ggml_backend_t /*backend*/, const ggml_tensor * src, ggml_tensor * dst, void * user_data) {
+    auto & ep = static_cast<llama_context *>(user_data)->prefetch;
+    if (!ep.enabled || !ep.where.count(src)) {
+        return false;
+    }
+    const auto [i, t] = ep.where[src];
+    const int s = i % 2;
+    dst->buffer = ep.slot_buf[s];
+    dst->data   = (char *) ggml_backend_buffer_get_base(ep.slot_buf[s]) + ep.offsets[i][t];
     return true;
 }
 

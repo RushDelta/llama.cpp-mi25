@@ -279,6 +279,7 @@ private:
 
     // expert prefetch (env LLAMA_MI25_PREFETCH): uploads the experts of the next CPU-expert layer while the current one computes
     static void sched_split_done(ggml_backend_t backend, ggml_cgraph * graph, void * user_data);
+    static bool sched_alloc_expert_copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, void * user_data);
     void expert_prefetch_setup();
     void expert_prefetch_upload(ggml_backend_t backend, int i, int s);
 
