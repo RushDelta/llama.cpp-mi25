@@ -2811,8 +2811,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             } else {
                 // Vulkan has no q8_0 -> f16 copy, so go through f32
                 ggml_tensor * vf = v->type == GGML_TYPE_F16 ? v : ggml_cast(ctx0, v, GGML_TYPE_F32);
-                vt = ggml_cpy(ctx0, ggml_transpose(ctx0, vf),
-                        ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, v->ne[1], v->ne[0], v->ne[2]));
+                // no ggml_cpy into a new tensor: that tensor is a graph leaf and stays allocated for the whole graph
+                vt = ggml_cast(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, vf)), GGML_TYPE_F16);
             }
             cb(vt, "v_cont", il);
 

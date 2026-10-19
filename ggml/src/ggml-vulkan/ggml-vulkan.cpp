@@ -14891,6 +14891,11 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             if (is_empty(graph->nodes[j])) {
                 continue;
             }
+            // MI25 chunked attention: pulling a large node forward keeps two chunks' scratch alive at once
+            static const bool mi25_fa_chunk = getenv("LLAMA_MI25_FA_CHUNK") && strcmp(getenv("LLAMA_MI25_FA_CHUNK"), "0") != 0;
+            if (mi25_fa_chunk && ggml_nbytes(graph->nodes[j]) > (32u << 20)) {
+                continue;
+            }
             // Protect every interior QSA node (not just the start): the mask branch is
             // independent, so it gets pulled out and breaks keep_pattern otherwise.
             auto const &in_qsa_pattern = [&](int n) -> bool {
