@@ -511,6 +511,13 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+
+    for (int s = 0; s < 2; ++s) {
+        ggml_backend_event_free(prefetch.slot_free[s]);
+        ggml_backend_buffer_free(prefetch.slot_buf[s]);
+    }
+    ggml_backend_event_free(prefetch.flush);
+    ggml_free(prefetch.ctx);
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -649,6 +656,10 @@ void llama_context::sched_reserve() {
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+    expert_prefetch_setup();
+    if (prefetch.enabled) {
+        ggml_backend_sched_set_split_done_callback(sched.get(), sched_split_done, this);
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -689,6 +700,9 @@ void llama_context::sched_reserve() {
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+                if (prefetch.enabled) {
+                    ggml_backend_sched_set_split_done_callback(sched.get(), sched_split_done, this);
+                }
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -2655,6 +2669,25 @@ ggml_status llama_context::graph_compute(
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
 
+    // prefetched experts for large batches, the slot was uploaded by the previous layer or is uploaded here
+    auto & ep = lctx->prefetch;
+    if (ep.enabled && ep.where.count(src) && ggml_graph_n_nodes(graph) > 0) {
+        const ggml_tensor * node = ggml_graph_node(graph, 0);
+        if (node->op == GGML_OP_MUL_MAT_ID && node->src[0] == dst && ggml_nelements(node->src[2]) >= 4*src->ne[2]) {
+            const auto [i, t] = ep.where[src];
+            const int s = i % 2;
+            if (ep.slot_layer[s] != i) {
+                lctx->expert_prefetch_upload(backend, i, s);
+            }
+            GGML_ASSERT(ggml_nbytes(dst) == ggml_nbytes(src));
+            dst->buffer = ep.slot_buf[s];
+            dst->data   = (char *) ggml_backend_buffer_get_base(ep.slot_buf[s]) + ep.offsets[i][t];
+            ep.cur_seen = ep.cur == i ? ep.cur_seen + 1 : 1;
+            ep.cur      = i;
+            return true;
+        }
+    }
+
     // the slot maps of the MoE cache
     if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
         return true;
@@ -2734,6 +2767,129 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     }
 
     return true;
+}
+
+void llama_context::expert_prefetch_setup() {
+    auto & ep = prefetch;
+    if (ep.init) {
+        return;
+    }
+    ep.init = true;
+
+    if (!getenv("LLAMA_MI25_PREFETCH") || moe_cache) {
+        return;
+    }
+
+    for (auto * backend : backend_ptrs) {
+        if (ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            ep.gpu = backend;
+            break;
+        }
+    }
+    if (!ep.gpu) {
+        return;
+    }
+
+    // layers with experts in host memory that run on the GPU
+    size_t slot_size = 0;
+    size_t max_tensors = 0;
+    for (int il = 0; il < (int) model.hparams.n_layer(); ++il) {
+        const auto & l = model.layers[il];
+        std::vector<const ggml_tensor *> ts;
+        std::vector<size_t> offs;
+        size_t size = 0;
+        for (const ggml_tensor * t : { l.ffn_gate_exps, l.ffn_up_exps, l.ffn_down_exps, l.ffn_gate_up_exps }) {
+            if (t && t->buffer && ggml_backend_buffer_is_host(t->buffer)) {
+                ts.push_back(t);
+                offs.push_back(size);
+                size += GGML_PAD(ggml_nbytes(t), 256);
+            }
+        }
+        if (ts.empty() || model.dev_layer(il) != ggml_backend_get_device(ep.gpu)) {
+            continue;
+        }
+        for (size_t k = 0; k < ts.size(); ++k) {
+            ep.where[ts[k]] = { (int) ep.layers.size(), (int) k };
+        }
+        ep.layers.push_back(il);
+        ep.tensors.push_back(ts);
+        ep.offsets.push_back(offs);
+        slot_size   = std::max(slot_size, size);
+        max_tensors = std::max(max_tensors, ts.size());
+    }
+    if (ep.layers.empty()) {
+        return;
+    }
+    slot_size += 512;
+
+    for (int s = 0; s < 2; ++s) {
+        ep.slot_buf[s]  = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(ep.gpu), slot_size);
+        ep.slot_free[s] = ggml_backend_event_new(ggml_backend_get_device(ep.gpu));
+    }
+    ep.flush = ggml_backend_event_new(ggml_backend_get_device(ep.gpu));
+
+    ggml_init_params params = { 2*max_tensors*ggml_tensor_overhead(), nullptr, true };
+    ep.ctx = ggml_init(params);
+
+    if (!ep.slot_buf[0] || !ep.slot_buf[1] || !ep.slot_free[0] || !ep.slot_free[1] || !ep.flush || !ep.ctx) {
+        LLAMA_LOG_WARN("%s: expert prefetch disabled, failed to allocate the staging buffers or events\n", __func__);
+        return;
+    }
+    for (int s = 0; s < 2; ++s) {
+        for (size_t k = 0; k < max_tensors; ++k) {
+            ep.views[s].push_back(ggml_new_tensor_1d(ep.ctx, GGML_TYPE_I8, 1));
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: expert prefetch enabled, %zu layers, 2 slots of %.2f MiB\n",
+            __func__, ep.layers.size(), slot_size/(1024.0*1024.0));
+    ep.enabled = true;
+}
+
+// upload the experts of entry i into slot s, after the compute that still reads the slot
+void llama_context::expert_prefetch_upload(ggml_backend_t backend, int i, int s) {
+    auto & ep = prefetch;
+
+    if (ep.slot_free_rec[s]) {
+        ggml_backend_event_wait(backend, ep.slot_free[s]);
+    }
+    for (size_t k = 0; k < ep.tensors[i].size(); ++k) {
+        const ggml_tensor * src = ep.tensors[i][k];
+        ggml_tensor * v = ep.views[s][k];
+        v->type   = src->type;
+        v->buffer = nullptr;
+        v->data   = nullptr;
+        memcpy(v->ne, src->ne, sizeof(v->ne));
+        memcpy(v->nb, src->nb, sizeof(v->nb));
+        ggml_backend_tensor_alloc(ep.slot_buf[s], v, (char *) ggml_backend_buffer_get_base(ep.slot_buf[s]) + ep.offsets[i][k]);
+        ggml_backend_tensor_set_async(backend, v, src->data, 0, ggml_nbytes(src));
+    }
+    ep.slot_layer[s] = i;
+}
+
+void llama_context::sched_split_done(ggml_backend_t backend, ggml_cgraph * /*graph*/, void * user_data) {
+    auto * lctx = static_cast<llama_context *>(user_data);
+    auto & ep = lctx->prefetch;
+
+    if (ep.cur < 0 || ep.cur_seen != (int) ep.tensors[ep.cur].size()) {
+        return;
+    }
+
+    // the slot is free once the compute of this layer finishes
+    const int s = ep.cur % 2;
+    ggml_backend_event_record(ep.slot_free[s], backend);
+    ep.slot_free_rec[s] = true;
+
+    // prefetch the next layer, the flush submits the transfer now
+    const int n  = (ep.cur + 1) % (int) ep.layers.size();
+    const int s2 = n % 2;
+    if (ep.slot_layer[s2] != n) {
+        lctx->expert_prefetch_upload(backend, n, s2);
+        ggml_backend_event_record(ep.flush, backend);
+    }
+
+    ep.cur      = -1;
+    ep.cur_seen = 0;
 }
 
 llm_graph_cb llama_context::graph_get_cb() const {

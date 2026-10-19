@@ -969,6 +969,9 @@ struct ggml_backend_sched {
     ggml_backend_sched_copy_callback callback_copy;
     void * callback_copy_user_data;
 
+    ggml_backend_sched_split_done_callback callback_split_done;
+    void * callback_split_done_user_data;
+
     char * context_buffer;
     size_t context_buffer_size;
 
@@ -1889,6 +1892,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
+            if (sched->callback_split_done != NULL) {
+                sched->callback_split_done(split_backend, &split->graph, sched->callback_split_done_user_data);
+            }
         } else {
             // similar to ggml_backend_compare_graph_backend
             for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
@@ -2141,6 +2147,12 @@ void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_copy = callback;
     sched->callback_copy_user_data = user_data;
+}
+
+void ggml_backend_sched_set_split_done_callback(ggml_backend_sched_t sched, ggml_backend_sched_split_done_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_split_done = callback;
+    sched->callback_split_done_user_data = user_data;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
