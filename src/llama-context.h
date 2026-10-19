@@ -14,6 +14,7 @@
 
 #include <array>
 #include <map>
+#include <unordered_map>
 #include <vector>
 
 struct llama_model;
@@ -282,6 +283,11 @@ private:
     // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
     static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);
 
+    // expert prefetch (env LLAMA_MI25_PREFETCH): uploads the experts of the next CPU-expert layer while the current one computes
+    static void sched_split_done(ggml_backend_t backend, ggml_cgraph * graph, void * user_data);
+    void expert_prefetch_setup();
+    void expert_prefetch_upload(ggml_backend_t backend, int i, int s);
+
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
@@ -391,6 +397,27 @@ private:
     // graph size is the same as the previously scheduled one (unexpected) or different
     int32_t n_reallocs_same = 0;
     int32_t n_reallocs_diff = 0;
+
+    struct expert_prefetch_info {
+        bool enabled = false;
+        bool init    = false;
+        ggml_backend_t gpu = nullptr;
+        std::vector<int> layers;                                // CPU-expert layers in graph order (ascending il)
+        std::vector<std::vector<const ggml_tensor *>> tensors;  // per entry of `layers`: its host expert tensors
+        std::vector<std::vector<size_t>> offsets;               // byte offset of each tensor inside a slot
+        std::unordered_map<const ggml_tensor *, std::pair<int,int>> where; // host tensor -> (index in layers, index in tensors)
+        ggml_backend_buffer_t slot_buf[2] = {};                 // device buffers, each sized for the largest layer
+        int slot_layer[2] = {-1, -1};                           // index in `layers` currently held, -1 = none
+        ggml_backend_event_t slot_free[2] = {};                 // recorded after the split(s) that read the slot
+        bool slot_free_rec[2] = {};                             // slot_free was recorded at least once
+        ggml_backend_event_t flush = nullptr;                   // recorded only to submit pending transfers
+        ggml_context * ctx = nullptr;                           // headers of the slot views
+        std::vector<ggml_tensor *> views[2];                    // per slot, one header per tensor of a layer
+        int cur = -1;                                           // index in `layers` of the layer being consumed
+        int cur_seen = 0;                                       // its tensors seen by the copy callback this ubatch
+    };
+
+    expert_prefetch_info prefetch;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
