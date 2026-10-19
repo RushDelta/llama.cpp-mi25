@@ -2780,6 +2780,88 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 
+        // MI25 experiment: large prompt batches as matmul attention chunked over query tokens (see LLAMA_MI25_FA_CHUNK)
+        static const bool     fa_chunk     = getenv("LLAMA_MI25_FA_CHUNK") && strcmp(getenv("LLAMA_MI25_FA_CHUNK"), "0") != 0;
+        static const int64_t  fa_min_tok   = getenv("LLAMA_MI25_FA_CHUNK_MIN_TOKENS") ? atoll(getenv("LLAMA_MI25_FA_CHUNK_MIN_TOKENS")) : 512;
+        static const int64_t  fa_min_kv    = getenv("LLAMA_MI25_FA_CHUNK_MIN_KV")     ? atoll(getenv("LLAMA_MI25_FA_CHUNK_MIN_KV"))     : 4096;
+        static const int64_t  fa_max_kv    = getenv("LLAMA_MI25_FA_CHUNK_MAX_KV")     ? atoll(getenv("LLAMA_MI25_FA_CHUNK_MAX_KV"))     : 32768;
+        static const int64_t  fa_budget    = (getenv("LLAMA_MI25_FA_CHUNK_MIB")       ? atoll(getenv("LLAMA_MI25_FA_CHUNK_MIB"))        : 128) << 20;
+
+        if (fa_chunk && q->ne[1] >= fa_min_tok && k->ne[1] >= fa_min_kv && k->ne[1] <= fa_max_kv &&
+                sinks == nullptr && v_mla == nullptr && n_kv_max == 0 && hparams.f_max_alibi_bias == 0.0f &&
+                !hparams.attn_soft_cap && arch != LLM_ARCH_GROK && kq_mask != nullptr && n_stream == 1 && cparams.offload_kqv) {
+            const int64_t n_tokens = q->ne[1];
+            const int64_t n_kv     = k->ne[1];
+            const int64_t n_head_q = q->ne[2];
+
+            int64_t C = fa_budget / (n_kv*n_head_q*4);
+            C = std::min(std::max(C/32*32, (int64_t) 32), n_tokens);
+
+            // Vulkan mul_mat reads a quantized src0 in place only if dim 0/1 are contiguous, which the permuted K view is not
+            ggml_tensor * kc = k;
+            if (ggml_is_quantized(k->type)) {
+                kc = ggml_cast(ctx0, ggml_cast(ctx0, k, GGML_TYPE_F32), GGML_TYPE_F16);
+                cb(kc, "k_cont", il);
+            }
+
+            // V as [n_kv, hsv, n_head_kv]: reuse the cache layout if already transposed, else transpose once per layer
+            ggml_tensor * vt;
+            if (v_trans) {
+                vt = ggml_transpose(ctx0, v);
+            } else {
+                // Vulkan has no q8_0 -> f16 copy, so go through f32
+                ggml_tensor * vf = v->type == GGML_TYPE_F16 ? v : ggml_cast(ctx0, v, GGML_TYPE_F32);
+                vt = ggml_cpy(ctx0, ggml_transpose(ctx0, vf),
+                        ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, v->ne[1], v->ne[0], v->ne[2]));
+            }
+            cb(vt, "v_cont", il);
+
+            std::vector<ggml_tensor *> parts;
+            for (int64_t c0 = 0; c0 < n_tokens; c0 += C) {
+                const int64_t cn = std::min(C, n_tokens - c0);
+
+                ggml_tensor * qc = ggml_view_4d(ctx0, q, q->ne[0], cn, q->ne[2], 1, q->nb[1], q->nb[2], q->nb[3], c0*q->nb[1]);
+
+                ggml_tensor * kq = ggml_mul_mat(ctx0, kc, qc);
+                ggml_prec_set_acc(kq, GGML_PREC_F32);
+                cb(kq, "kq", il);
+
+                ggml_tensor * mc = ggml_view_2d(ctx0, kq_mask, n_kv, cn, kq_mask->nb[1], c0*kq_mask->nb[1]);
+
+                kq = ggml_soft_max_ext(ctx0, kq, mc, kq_scale, 0.0f);
+                cb(kq, "kq_soft_max", il);
+
+                ggml_tensor * kqv = ggml_mul_mat(ctx0, vt, kq);
+                cb(kqv, "kqv", il);
+
+                parts.push_back(kqv);
+            }
+
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                LLAMA_LOG_INFO("mi25 fa-chunk: n_tokens=%d, n_kv=%d, C=%d, chunks=%d\n",
+                        (int) n_tokens, (int) n_kv, (int) C, (int) parts.size());
+            }
+
+            // balanced pairwise join along the token dim
+            while (parts.size() > 1) {
+                std::vector<ggml_tensor *> next;
+                for (size_t i = 0; i + 1 < parts.size(); i += 2) {
+                    next.push_back(ggml_concat(ctx0, parts[i], parts[i + 1], 1));
+                }
+                if (parts.size() % 2) {
+                    next.push_back(parts.back());
+                }
+                parts = std::move(next);
+            }
+
+            cur = ggml_permute(ctx0, parts[0], 0, 2, 1, 3);
+            cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+            ggml_build_forward_expand(gf, cur);
+            return cur;
+        }
+
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
