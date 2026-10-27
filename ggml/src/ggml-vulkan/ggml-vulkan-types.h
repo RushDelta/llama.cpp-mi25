@@ -707,6 +707,7 @@ struct vk_device_struct {
     bool subgroup_clustered;
     bool subgroup_vote;
     bool multi_add;
+    bool multi_add_small;  // compact push constants, at most MULTI_ADD_SMALL_TENSORS - 2 fused adds
     bool shader_int64;
     bool buffer_device_address;
     bool vulkan_memory_model;

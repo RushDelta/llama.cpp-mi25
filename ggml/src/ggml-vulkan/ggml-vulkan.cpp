@@ -1268,6 +1268,11 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
             // Here low-batch FA with large head size is affected.
             // n_rows < 4 switch because workgroup size switches from 128 to 256 there.
             result.limit_occupancy_shmem = (n_rows < 4 ? 14 : 26) * 1024 / 4 / 4;
+            // GGML_VK_FA_GCN_OCC_KB overrides the occupancy-limiting shmem size in KB (0 disables the limit)
+            static const char * occ_kb = getenv("GGML_VK_FA_GCN_OCC_KB");
+            if (occ_kb != nullptr) {
+                result.limit_occupancy_shmem = (uint32_t) atoi(occ_kb) * 1024 / 4 / 4;
+            }
         }
     }
 
@@ -2877,6 +2882,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             rm_kq = 4;
             rm_stdq_int = 4;
         }
+    }
+    // GGML_VK_RM_KQ / GGML_VK_RM_STDQ override the mat-vec rows per workgroup (k-quants / legacy quants)
+    if (getenv("GGML_VK_RM_KQ")) {
+        rm_kq = (uint32_t) atoi(getenv("GGML_VK_RM_KQ"));
+    }
+    if (getenv("GGML_VK_RM_STDQ")) {
+        rm_stdq = (uint32_t) atoi(getenv("GGML_VK_RM_STDQ"));
     } else if (device->vendor_id == VK_VENDOR_ID_INTEL) {
         rm_stdq = 2;
         rm_stdq_int = 2;
@@ -3384,6 +3396,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         for (uint32_t i = 0; i < MAX_FUSED_ADDS; ++i) {
             ggml_vk_create_pipeline2(device, device->pipeline_multi_add[i],     "multi_add_f32_"     + std::to_string(i+1), multi_add_f32_len,     multi_add_f32_data,     "main", MAX_PARAMETER_COUNT, sizeof(vk_op_multi_add_push_constants), {512, 1, 1}, {i+2}, 1);
             ggml_vk_create_pipeline2(device, device->pipeline_multi_add_rms[i], "multi_add_rms_f32_" + std::to_string(i+1), multi_add_rms_f32_len, multi_add_rms_f32_data, "main", MAX_PARAMETER_COUNT, sizeof(vk_op_multi_add_push_constants), {512, 1, 1}, {i+2}, 1);
+        }
+    } else if (device->multi_add_small) {
+        for (uint32_t i = 0; i < MULTI_ADD_SMALL_TENSORS - 2; ++i) {
+            ggml_vk_create_pipeline2(device, device->pipeline_multi_add[i],     "multi_add_small_f32_"     + std::to_string(i+1), multi_add_small_f32_len,     multi_add_small_f32_data,     "main", MAX_PARAMETER_COUNT, sizeof(vk_op_multi_add_small_push_constants), {512, 1, 1}, {i+2}, 1);
+            ggml_vk_create_pipeline2(device, device->pipeline_multi_add_rms[i], "multi_add_rms_small_f32_" + std::to_string(i+1), multi_add_rms_small_f32_len, multi_add_rms_small_f32_data, "main", MAX_PARAMETER_COUNT, sizeof(vk_op_multi_add_small_push_constants), {512, 1, 1}, {i+2}, 1);
         }
     }
 
@@ -4552,6 +4569,9 @@ vk_device ggml_vk_get_device(size_t idx) {
         device->multi_add = vk12_props.shaderRoundingModeRTEFloat16 &&
                             device->properties.limits.maxPushConstantsSize >= sizeof(vk_op_multi_add_push_constants) &&
                             getenv("GGML_VK_DISABLE_MULTI_ADD") == nullptr;
+        device->multi_add_small = !device->multi_add && vk12_props.shaderRoundingModeRTEFloat16 &&
+                                  device->properties.limits.maxPushConstantsSize >= sizeof(vk_op_multi_add_small_push_constants) &&
+                                  getenv("GGML_VK_DISABLE_MULTI_ADD") == nullptr;
 
         device->shader_int64 = device_features2.features.shaderInt64;
         device->buffer_device_address = vk12_features.bufferDeviceAddress;
@@ -8019,7 +8039,10 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
 static bool ggml_vk_use_mul_mat_vec_id(const ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * ids = dst->src[2];
-    return ids->ne[1] <= 8 && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
+    // GGML_VK_MMVID_MAX_TOKENS: largest token count that uses the per-token mat-vec path (default 8). On gfx900 the
+    // tiled MUL_MAT_ID kernel is ~4x slower than per-token mat-vec at 16 tokens (speculative-decoding verify batches).
+    static const int64_t max_tokens = getenv("GGML_VK_MMVID_MAX_TOKENS") ? atoi(getenv("GGML_VK_MMVID_MAX_TOKENS")) : 8;
+    return ids->ne[1] <= max_tokens && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
 }
 
 bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int node_idx) {
@@ -10076,6 +10099,19 @@ void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_c
     }
 
     static_assert(MAX_PARAMETER_COUNT == 12);
+    vk_op_multi_add_small_push_constants pc_small;
+    const bool use_small_pc = !ctx->device->multi_add;
+    if (use_small_pc) {
+        GGML_ASSERT(num_tensors <= MULTI_ADD_SMALL_TENSORS);
+        pc_small.ne20 = pc.ne20; pc_small.ne21 = pc.ne21; pc_small.ne22 = pc.ne22; pc_small.ne23 = pc.ne23;
+        for (uint32_t i = 0; i < num_tensors; ++i) {
+            for (uint32_t k = 0; k < 4; ++k) {
+                pc_small.nb[i][k] = pc.nb[i][k];
+            }
+        }
+        pc_small.rms_partials = pc.rms_partials;
+    }
+    auto dispatch = [&](const auto & pcv) {
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {
             ggml_vk_subbuffer(ctx, buf[0], offset[0]),
@@ -10090,7 +10126,13 @@ void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_c
             ggml_vk_subbuffer(ctx, buf[9], offset[9]),
             ggml_vk_subbuffer(ctx, buf[10], offset[10]),
             ggml_vk_subbuffer(ctx, buf[11], offset[11]),
-        }, pc, elements);
+        }, pcv, elements);
+    };
+    if (use_small_pc) {
+        dispatch(pc_small);
+    } else {
+        dispatch(pc);
+    }
 }
 
 void ggml_vk_add(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -14320,14 +14362,15 @@ uint32_t ggml_vk_fuse_multi_add(ggml_backend_vk_context * ctx, const struct ggml
         return 0;
     }
 
-    if (!ctx->device->multi_add) {
+    if (!ctx->device->multi_add && !ctx->device->multi_add_small) {
         return 0;
     }
 
+    const int32_t max_adds = ctx->device->multi_add ? MAX_FUSED_ADDS : MULTI_ADD_SMALL_TENSORS - 2;
     int32_t num_adds = 1;
     while (node_idx + num_adds < cgraph->n_nodes &&
            cgraph->nodes[node_idx + num_adds]->op == GGML_OP_ADD &&
-           num_adds < MAX_FUSED_ADDS) {
+           num_adds < max_adds) {
         num_adds++;
     }
 
