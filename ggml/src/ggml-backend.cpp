@@ -985,6 +985,10 @@ struct ggml_backend_sched {
 
     int debug;
 
+    // per-split decode timing [GGML_SCHED_TIMING]: syncs after every split and prints one line per graph to stderr
+    bool timing;
+    int64_t timing_prev_end_us;
+
     // graph size of the current and the previous scheduling, used by the realloc callback and for debugging
     // graph reallocations [GGML_SCHED_DEBUG_REALLOC]
     // ref: https://github.com/ggml-org/llama.cpp/pull/17617
@@ -1879,10 +1883,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    // [GGML_SCHED_TIMING] per backend: splits, nodes, copy, issue (compute_async call), wait (synchronize) in us
+    int64_t tm_n[GGML_SCHED_MAX_BACKENDS] = {0}, tm_nodes[GGML_SCHED_MAX_BACKENDS] = {0};
+    int64_t tm_copy[GGML_SCHED_MAX_BACKENDS] = {0}, tm_issue[GGML_SCHED_MAX_BACKENDS] = {0}, tm_wait[GGML_SCHED_MAX_BACKENDS] = {0};
+    const int64_t tm_start = sched->timing ? ggml_time_us() : 0;
+    int64_t tm_t = tm_start;
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        if (sched->timing) {
+            tm_t = ggml_time_us();
+        }
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -1907,10 +1920,26 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (sched->timing) {
+            ggml_backend_synchronize(split_backend);
+            const int64_t t = ggml_time_us();
+            tm_copy[split_backend_id] += t - tm_t;
+            tm_t = t;
+        }
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
+            }
+            if (sched->timing) {
+                const int64_t t1 = ggml_time_us();
+                ggml_backend_synchronize(split_backend);
+                const int64_t t2 = ggml_time_us();
+                tm_n[split_backend_id]++;
+                tm_nodes[split_backend_id] += split->graph.n_nodes;
+                tm_issue[split_backend_id] += t1 - tm_t;
+                tm_wait[split_backend_id] += t2 - t1;
             }
             if (sched->callback_split_done != NULL) {
                 sched->callback_split_done(split_backend, &split->graph, sched->callback_split_done_user_data);
@@ -1957,6 +1986,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         prev_backend_id = split_backend_id;
     }
 
+    if (sched->timing) {
+        const int64_t tm_end = ggml_time_us();
+        fprintf(stderr, "SCHED_TIMING gap=%lld total=%lld splits=%d",
+                (long long) (sched->timing_prev_end_us ? tm_start - sched->timing_prev_end_us : 0),
+                (long long) (tm_end - tm_start), sched->n_splits);
+        for (int b = 0; b < sched->n_backends; b++) {
+            if (tm_n[b] > 0) {
+                fprintf(stderr, " | %s n=%lld nodes=%lld copy=%lld issue=%lld wait=%lld", ggml_backend_name(sched->backends[b]),
+                        (long long) tm_n[b], (long long) tm_nodes[b], (long long) tm_copy[b], (long long) tm_issue[b], (long long) tm_wait[b]);
+            }
+        }
+        fprintf(stderr, "\n");
+        sched->timing_prev_end_us = tm_end;
+    }
+
     return GGML_STATUS_SUCCESS;
 }
 
@@ -1980,6 +2024,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
 #ifdef GGML_SCHED_NO_REALLOC
     sched->debug_realloc = 1;
 #endif
+    sched->timing = getenv("GGML_SCHED_TIMING") != NULL;
+
     const char * GGML_SCHED_DEBUG_REALLOC = getenv("GGML_SCHED_DEBUG_REALLOC");
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
 
