@@ -12815,6 +12815,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // qwen3.8-27b decode mat-vec shapes (n = 1): ffn gate/up, ffn down, attn qkv, ssm/attn out
+    for (ggml_type type_a : {GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_0, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
+                             GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL}) {
+        for (auto mk : std::vector<std::array<int64_t, 2>>{{17408, 5120}, {5120, 17408}, {10240, 5120}, {5120, 6144}}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, mk[0], 1, mk[1], {1, 1}, {1, 1}));
+        }
+    }
+
+    // qwen3.6-35b-a3b decode dense mat-vec shapes (n = 1)
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        for (auto mk : std::vector<std::array<int64_t, 2>>{{2048, 4096}, {8192, 2048}, {4096, 2048}, {512, 2048}, {32, 2048}}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, mk[0], 1, mk[1], {1, 1}, {1, 1}));
+        }
+    }
+
+    // qwen3.6-35b-a3b decode expert mat-vec formats (n = 1 decode, n = 16 ngram verify)
+    for (int bs : {1, 4, 8, 12, 16, 24, 32, 48, 64}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q4_0, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_Q3_K}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 512, bs, 2048));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 2048, bs, 512));
+        }
+    }
+
     // qwen3.6-35b-a3b (256 experts, 8 used)
     for (int bs : {64, 128, 256, 512, 1024, 2048}) {  // small sizes: short agent turns
         for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
@@ -12830,7 +12853,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     // qwen3.6-35b-a3b decode FA at long context
     for (int64_t kv : {8192, 32768, 73728}) {
-        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        for (auto kvt : std::vector<std::array<ggml_type, 2>>{{GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}, {GGML_TYPE_F16, GGML_TYPE_F16},
+                                                               {GGML_TYPE_Q4_0, GGML_TYPE_Q4_0}, {GGML_TYPE_Q4_1, GGML_TYPE_Q4_1},
+                                                               {GGML_TYPE_Q5_1, GGML_TYPE_Q5_1}, {GGML_TYPE_Q5_1, GGML_TYPE_Q4_0}}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, kvt[0], kvt[1]));
+        }
     }
     // qwen3.8-27b prompt processing FA (head size 256, 4 KV heads, GQA 6)
     for (int64_t kv : {4096, 8192}) {
