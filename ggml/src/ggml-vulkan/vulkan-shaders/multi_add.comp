@@ -17,7 +17,10 @@ layout (push_constant) uniform parameter2
     uint ne20; uint ne21; uint ne22; uint ne23;
 
     // strides for srcs+dst
-    uint nb[12][4];
+#ifndef MULTI_ADD_NB
+#define MULTI_ADD_NB 12
+#endif
+    uint nb[MULTI_ADD_NB][4];
 
     uint rms_partials;
 } p;

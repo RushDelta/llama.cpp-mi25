@@ -428,6 +428,16 @@ static_assert(MAX_PARAMETER_COUNT == 12);
 
 static_assert(sizeof(vk_op_multi_add_push_constants) <= 256);
 
+// Compact variant for devices with 128-byte push constants (e.g. AMD gfx900 on Windows): up to 5 srcs + dst
+#define MULTI_ADD_SMALL_TENSORS 6
+struct vk_op_multi_add_small_push_constants {
+    uint32_t ne20; uint32_t ne21; uint32_t ne22; uint32_t ne23;
+    uint32_t nb[MULTI_ADD_SMALL_TENSORS][4];
+    uint32_t rms_partials;
+};
+
+static_assert(sizeof(vk_op_multi_add_small_push_constants) <= 128);
+
 struct vk_op_topk_moe_push_constants {
     uint32_t n_rows;
     uint32_t n_experts_push;
