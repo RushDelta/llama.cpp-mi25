@@ -430,6 +430,7 @@ enum FaCodePath {
     FA_SCALAR,
     FA_COOPMAT1,
     FA_COOPMAT2,
+    FA_DECODE_GCN,
 };
 
 struct vk_fa_pipeline_state {

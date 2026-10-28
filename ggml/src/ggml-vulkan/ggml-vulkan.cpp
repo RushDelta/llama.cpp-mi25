@@ -1284,6 +1284,19 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
     return result;
 }
 
+static vk_fa_tuning_params get_fa_tuning_params_decode_gcn() {
+    vk_fa_tuning_params result{};
+    result.path = FA_DECODE_GCN;
+    result.workgroup_size = 64;
+    result.subgroup_size = 64;
+    result.block_rows = 8;
+    result.block_cols = 64;
+    result.d_split = 1;
+    result.row_split = 1;
+
+    return result;
+}
+
 static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
     GGML_UNUSED(n_rows);
     GGML_UNUSED(n_kv);
@@ -2095,6 +2108,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                 sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
                                 get_fa_spec_constants(fa.first), aligned ? Bc : 1, true,
                                 !fa_ds, !fa_ds ? fa_sgs : 0);
+    }
+
+    for (auto &fa : device->pipeline_flash_attn_f32_f16) {
+        if (fa.first.path != FA_DECODE_GCN) continue;
+        ggml_vk_create_pipeline(device, fa.second, fa.first.aligned ? "flash_attn_decode_gcn_aligned" : "flash_attn_decode_gcn",
+                                flash_attn_decode_gcn_f32_len, flash_attn_decode_gcn_f32_data, "main", 8,
+                                sizeof(vk_flash_attn_push_constants), {fa.first.Br, 1, 1},
+                                get_fa_spec_constants(fa.first), fa.first.aligned ? fa.first.Bc : 1, true, true, 64);
     }
 
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
@@ -8208,6 +8229,21 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                             (int64_t)KV >= std::max<int64_t>(4096, min_ratio * (int64_t)n_kv_max) &&
                             (gqa_ratio > 1 || (tuning_params.path == FA_SCALAR && N == 1));
 
+    // GCN decode kernel for GQA batches (see docs/mi25-fa-decode-gcn.md). K/V are quantized here, so use_dequant_kv is already excluded.
+    static const char * decode_gcn_env = getenv("GGML_VK_FA_DECODE_GCN");
+    static const char * decode_gcn_split_mult_env = getenv("GGML_VK_FA_DECODE_GCN_SPLIT_MULT");
+    static const uint32_t decode_gcn_split_mult = decode_gcn_split_mult_env ? (uint32_t) atoi(decode_gcn_split_mult_env) : 8;
+    const bool decode_gcn = !(decode_gcn_env && strcmp(decode_gcn_env, "0") == 0) &&
+                            ctx->device->architecture == vk_device_architecture::AMD_GCN &&
+                            tuning_params.path == FA_SCALAR &&
+                            gqa_ratio > 1 && gqa_ratio <= 8 && HSK == 256 && HSV == 256 &&
+                            (k_type_eff == GGML_TYPE_Q8_0 || k_type_eff == GGML_TYPE_Q5_1 || k_type_eff == GGML_TYPE_Q4_0) &&
+                            (v_type_eff == GGML_TYPE_Q8_0 || v_type_eff == GGML_TYPE_Q5_1 || v_type_eff == GGML_TYPE_Q4_0) &&
+                            !use_sparse && sinks == nullptr && max_bias == 0.0f && logit_softcap == 0.0f;
+    if (decode_gcn) {
+        tuning_params = get_fa_tuning_params_decode_gcn();
+    }
+
     const uint32_t q_stride = (uint32_t)(nbq1 / ggml_type_size(q->type));
     uint32_t k_stride = (uint32_t)(nbk1 / ggml_type_size(k->type));
     uint32_t v_stride = (uint32_t)(nbv1 / ggml_type_size(v->type));
@@ -8241,7 +8277,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     }
 
     // Only use mask opt when the mask is fairly large. This hasn't been tuned extensively.
-    bool use_mask_opt = mask && !use_sparse && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
+    bool use_mask_opt = !decode_gcn && mask && !use_sparse && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
@@ -8304,7 +8340,8 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         const uint32_t per_blocks = CEIL_DIV(total_blocks, split_k);
         split_k = CEIL_DIV(total_blocks, per_blocks);
     } else if (gqa_ratio > 1 && workgroups_x <= Br) {
-        split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
+        const uint32_t split_mult = decode_gcn ? decode_gcn_split_mult : 2;
+        split_k = shader_core_count * split_mult / (workgroups_x * workgroups_y * workgroups_z);
     } else if (gqa_ratio <= 1) {
         uint32_t total_wgs_no_split = Tr * workgroups_y * workgroups_z;
         if (total_wgs_no_split < shader_core_count * 2) {
