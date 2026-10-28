@@ -11498,6 +11498,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // GQA decode / small spec-verify batches with quantized K/V (Vulkan GCN decode kernel):
+    // qwen3.6-35b-a3b (2 KV heads, GQA 8) and qwen3.8-27b (4 KV heads, GQA 6), head size 256.
+    // kv 100 / 1000 / 73729 are not multiples of the 64-column tile; 73728 covers long-context split_k.
+    for (auto nh_gqa : std::vector<std::array<int64_t, 2>>{{2, 8}, {4, 6}}) {
+        for (int64_t kv : {100, 1000, 8192, 32768, 73728, 73729}) {
+            for (int64_t nb : {1, 3, 8}) {
+                for (auto kvt : std::vector<std::array<ggml_type, 2>>{{GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}, {GGML_TYPE_Q5_1, GGML_TYPE_Q4_0},
+                                                                       {GGML_TYPE_Q4_0, GGML_TYPE_Q5_1}}) {
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh_gqa[0], {nh_gqa[1], 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, kvt[0], kvt[1]));
+                }
+            }
+        }
+        // no mask, and large logits (softmax max tracking across tiles and splits)
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh_gqa[0], {nh_gqa[1], 1}, 8192, 1, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256, nh_gqa[0], {nh_gqa[1], 1}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256, nh_gqa[0], {nh_gqa[1], 1}, 1000, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q5_1, GGML_TYPE_Q4_0));
+        // features the decode kernel does not handle must still be correct (fallback): sinks, ALiBi, softcap
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh_gqa[0], {nh_gqa[1], 1}, 1000, 1, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh_gqa[0], {nh_gqa[1], 1}, 1000, 1, true, false, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh_gqa[0], {nh_gqa[1], 1}, 1000, 1, true, false, 0, 30.0f, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    }
+
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
@@ -12076,6 +12098,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                                                                {GGML_TYPE_Q5_1, GGML_TYPE_Q5_1}, {GGML_TYPE_Q5_1, GGML_TYPE_Q4_0}}) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, kvt[0], kvt[1]));
         }
+        // ngram spec-verify batch (4 tokens), shipped KV types
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q5_1, GGML_TYPE_Q4_0));
+        // qwen3.8-27b decode (4 KV heads, GQA 6), q8_0 KV
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     }
     // qwen3.8-27b prompt processing FA (head size 256, 4 KV heads, GQA 6)
     for (int64_t kv : {4096, 8192}) {
