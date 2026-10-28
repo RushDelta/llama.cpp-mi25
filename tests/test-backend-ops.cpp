@@ -11518,6 +11518,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh_gqa[0], {nh_gqa[1], 1}, 1000, 1, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh_gqa[0], {nh_gqa[1], 1}, 1000, 1, true, false, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh_gqa[0], {nh_gqa[1], 1}, 1000, 1, true, false, 0, 30.0f, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+
+        // review coverage for the decode kernel:
+        // kv <= 64 gives split_k == 1, the only way to reach the non-split normalization/store path
+        for (int64_t kv : {40, 64}) {
+            for (int64_t nb : {1, 3}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh_gqa[0], {nh_gqa[1], 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh_gqa[0], {nh_gqa[1], 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q5_1, GGML_TYPE_Q4_0));
+            }
+        }
+        for (int64_t kv : {1000, 8192}) {
+            for (int64_t nb : {1, 3}) {
+                // ne3 = 2: iq3 offsets for Q/K/V/O/split_k and the nem3 != 1 mask branch
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh_gqa[0], {nh_gqa[1], 2}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+                // permuted Q/K/V, as llama.cpp builds them from the KV cache
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh_gqa[0], {nh_gqa[1], 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh_gqa[0], {nh_gqa[1], 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q5_1, GGML_TYPE_Q4_0, {0, 2, 1, 3}));
+            }
+        }
+        // mostly -inf masks (fully masked tiles and splits), kept below the sparse-path thresholds
+        // (KV < 4096, or KV < 16 * n_kv_max) so the dense decode kernel runs
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh_gqa[0], {nh_gqa[1], 1}, 1000, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 64));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh_gqa[0], {nh_gqa[1], 1}, 1000, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q5_1, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 64));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh_gqa[0], {nh_gqa[1], 1}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 1024));
     }
 
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
