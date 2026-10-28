@@ -1150,6 +1150,16 @@ void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subctx) {
         ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
     }
 
+    // GGML_VK_DIAG_NO_BARRIERS=1: timing diagnostic only, results are WRONG. Skips the compute-queue barriers
+    // between dispatches; transfer-queue and staging-copy barriers (ctx == nullptr) are kept.
+    static const bool diag_no_barriers = getenv("GGML_VK_DIAG_NO_BARRIERS") && strcmp(getenv("GGML_VK_DIAG_NO_BARRIERS"), "1") == 0;
+    if (ctx && !transfer_queue) {
+        ctx->diag_n_barriers++;
+        if (diag_no_barriers) {
+            return;
+        }
+    }
+
     subctx->s->buffer->buf.pipelineBarrier(
         subctx->p->q->stage_flags,
         subctx->p->q->stage_flags,
@@ -14950,6 +14960,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
         }
         ctx->perf_logger->print_timings();
+    }
+
+    // GGML_VK_DIAG_COUNT=1: print the compute dispatches and barriers recorded for each graph
+    static const bool diag_count = getenv("GGML_VK_DIAG_COUNT") != nullptr;
+    if (diag_count) {
+        fprintf(stderr, "VK_DIAG nodes=%d dispatches=%u barriers=%u\n", cgraph->n_nodes, ctx->diag_n_dispatches, ctx->diag_n_barriers);
+        ctx->diag_n_dispatches = ctx->diag_n_barriers = 0;
     }
 
     if (!ctx->device->support_async) {

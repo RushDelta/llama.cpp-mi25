@@ -1297,6 +1297,10 @@ struct ggml_backend_vk_context {
     std::vector<int> query_node_idx;
     int32_t num_queries {};
     int32_t query_idx {};
+
+    // compute dispatches and barriers since the last graph end [GGML_VK_DIAG_COUNT]
+    uint32_t diag_n_dispatches {};
+    uint32_t diag_n_barriers {};
 };
 
 struct ggml_backend_vk_buffer_context {

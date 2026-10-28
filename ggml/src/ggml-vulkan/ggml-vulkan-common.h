@@ -320,6 +320,7 @@ inline void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     {
         ggml_vk_debug_label dbg(subctx, pipeline->name, wg0, wg1, wg2);
         subctx->s->buffer->buf.dispatch(wg0, wg1, wg2);
+        ctx->diag_n_dispatches++;
     }
 }
 
