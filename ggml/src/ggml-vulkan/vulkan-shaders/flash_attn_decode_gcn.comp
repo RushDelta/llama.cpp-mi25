@@ -1,0 +1,151 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+#include "types.glsl"
+#include "flash_attn_base.glsl"
+#include "flash_attn_dequant.glsl"
+
+layout (binding = 0) readonly buffer QV4 {vec4 data_qv4[];};
+layout (binding = 3) readonly buffer M {float16_t data_m[];};
+
+// One wave of 64 lanes. Lane c owns KV column j*Bc + c in the score phase,
+// and output dims 4*lane .. 4*lane+3 in the value phase.
+shared float Psh[Br * Bc];
+
+void main() {
+#ifdef NEEDS_INIT_IQ_SHMEM
+    if (fa_type_needs_shmem(FaTypeK) || fa_type_needs_shmem(FaTypeV)) {
+        init_iq_shmem(gl_WorkGroupSize);
+    }
+#endif
+
+    init_indices();
+
+    const uint32_t lane = gl_LocalInvocationIndex;
+
+    // Use -FLT_MAX/2 rather than -inf to reduce the possibility of NaNs.
+    const float NEG_FLT_MAX_OVER_2 = uintBitsToFloat(0xFEFFFFFF);
+
+    const uint32_t q_offset = gqa_iq1*p.nb01 + (iq2*p.nb02 + iq3*p.nb03) / 4;
+
+    const uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / FaBlockBytesK;
+    const uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / FaBlockBytesV;
+    uint32_t m_offset = gqa_iq1*KV;
+    if (p.nem2 != 1 || p.nem3 != 1) {
+        m_offset += ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.nem1 * KV;
+    }
+
+    float Lf[Br], Mf[Br];
+    FLOAT_TYPEV4 Of[Br];
+    [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+        Lf[r] = 0.0f;
+        Mf[r] = NEG_FLT_MAX_OVER_2;
+        Of[r] = FLOAT_TYPEV4(0.0f);
+    }
+
+    [[dont_unroll]]
+    for (uint32_t j = start_j; j < end_j; ++j) {
+        // Score phase: lane c computes the full dot product for KV column j*Bc + c.
+        uint32_t kcol;
+        const bool kv_active = fa_kv_index(j * Bc + lane, kcol);
+
+        float Sf[Br];
+        [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+            Sf[r] = 0.0f;
+        }
+        if (kv_active) {
+            for (uint32_t d4 = 0; d4 < HSK / 4; ++d4) {
+                const uint32_t coord = kcol * k_stride * BLOCK_SIZE_K + 4 * d4;
+                const FLOAT_TYPEV4 K4 = dequantize4(coord / BLOCK_SIZE_K, coord % BLOCK_SIZE_K, k_offset, BINDING_IDX_K);
+                [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+                    if (r < N) {
+                        Sf[r] += dot(data_qv4[q_offset / 4 + r * q_stride / 4 + d4], K4);
+                    }
+                }
+            }
+        }
+
+        [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+            if (r < N) {
+                float s = NEG_FLT_MAX_OVER_2;
+                if (kv_active) {
+                    s = Sf[r] * p.scale;
+                    if (MASK_ENABLE) {
+                        s += float(data_m[m_offset + kcol]);
+                    }
+                }
+                Sf[r] = s;
+            }
+        }
+
+        // Online softmax. All lanes end up with the same M and L.
+        [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+            if (r < N) {
+                const float rowmax = subgroupMax(Sf[r]);
+                const float Mnew = max(Mf[r], rowmax + FATTN_KQ_MAX_OFFSET);
+                const float eM = exp(Mf[r] - Mnew);
+                const float Pr = kv_active ? exp(Sf[r] - Mnew) : 0.0f;
+
+                Lf[r] = Lf[r] * eM + subgroupAdd(Pr);
+                Mf[r] = Mnew;
+                Of[r] *= eM;
+                Psh[r * Bc + lane] = Pr;
+            }
+        }
+
+        // Value phase: lane t owns output vec4 t. Each V element is dequantized once and used for all rows.
+        barrier();
+        for (uint32_t c = 0; c < Bc; ++c) {
+            uint32_t vcol;
+            if (!fa_kv_index(j * Bc + c, vcol)) {
+                continue;
+            }
+            const uint32_t coord = vcol * v_stride * BLOCK_SIZE_V + 4 * lane;
+            const FLOAT_TYPEV4 V4 = dequantize4(coord / BLOCK_SIZE_V, coord % BLOCK_SIZE_V, v_offset, BINDING_IDX_V);
+            [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+                if (r < N) {
+                    Of[r] += Psh[r * Bc + c] * V4;
+                }
+            }
+        }
+        barrier();
+    }
+
+    // If there is split_k, the split_k resolve shader does the final division by L.
+    if (p.k_num > 1) {
+        const uint32_t o_offset = HSV * p.ne1 * (split_k_index + p.k_num * (gqa_iq1 + p.ne2 * iq3)) / 4;
+        [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+            if (r < N) {
+                gqaStore(r, lane, Of[r], o_offset, iq2, N);
+            }
+        }
+
+        const uint32_t lm_offset = HSV * p.ne1 * p.k_num * p.ne2 * p.ne3 + p.ne1 * 2 * (split_k_index + p.k_num * (gqa_iq1 + p.ne2 * iq3));
+        if (lane == 0) {
+            [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+                perElemOpStoreCol0(r, 0u, Lf[r], lm_offset, iq2, N);
+                perElemOpStoreCol0(r, 0u, Mf[r], lm_offset + p.ne1, iq2, N);
+            }
+        }
+        return;
+    }
+
+    [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+        if (r < N) {
+            Of[r] *= (Lf[r] == 0.0f) ? 0.0f : (1.0f / Lf[r]);
+        }
+    }
+
+    const uint32_t o_offset = (gqa_iq1*p.ne1*HSV + iq3*p.ne2*p.ne1*HSV) / 4;
+    [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+        if (r < N) {
+            gqaStore(r, lane, Of[r], o_offset, iq2, N);
+        }
+    }
+}

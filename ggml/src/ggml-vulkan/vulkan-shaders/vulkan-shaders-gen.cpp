@@ -756,6 +756,11 @@ void process_shaders() {
         }
     }
 
+    // GCN decode: fp32 math only. Default fp16 arg keeps the symbol name without the _fp32 suffix.
+    string_to_spv("flash_attn_decode_gcn_f32", "flash_attn_decode_gcn.comp",
+        {{"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"FLOAT_TYPEV4", "vec4"}, {"ACC_TYPE", "float"}, {"ACC_TYPEV2", "vec2"}, {"ACC_TYPEV4", "vec4"},
+         {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"DATA_A_IQ4_NL", "1"}});
+
     const std::map<std::string, std::string> fa_bf16_dict = {
         {"FLOAT_TYPE",   "bfloat16_t"},
         {"FLOAT_TYPEV2", "bf16vec2"},
