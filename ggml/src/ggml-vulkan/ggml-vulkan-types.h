@@ -1304,6 +1304,7 @@ struct ggml_backend_vk_context {
     uint32_t diag_n_dispatches {};
     uint32_t diag_n_barriers {};
     bool diag_skip_barriers {};  // GGML_VK_DIAG_NO_BARRIERS, set per graph
+    uint32_t diag_last_graph_dispatches {};  // dispatches recorded by the last graph_compute (for tests)
 };
 
 struct ggml_backend_vk_buffer_context {

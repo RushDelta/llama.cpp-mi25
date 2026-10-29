@@ -14511,6 +14511,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     // weight matmul over more than one token. Prompt graphs keep them (without, prompt processing slows to ~1 t/s).
     static const bool diag_no_barriers = getenv("GGML_VK_DIAG_NO_BARRIERS") && strcmp(getenv("GGML_VK_DIAG_NO_BARRIERS"), "1") == 0;
     ctx->diag_skip_barriers = diag_no_barriers;
+    const uint32_t diag_dispatches_start = ctx->diag_n_dispatches;
     for (int i = 0; i < cgraph->n_nodes && ctx->diag_skip_barriers; i++) {
         const ggml_tensor * n = cgraph->nodes[i];
         if ((n->op == GGML_OP_MUL_MAT || n->op == GGML_OP_MUL_MAT_ID) && ggml_is_quantized(n->src[0]->type) &&
@@ -15009,6 +15010,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
         ctx->perf_logger->print_timings();
     }
+
+    ctx->diag_last_graph_dispatches = ctx->diag_n_dispatches - diag_dispatches_start;
 
     // GGML_VK_DIAG_COUNT=1: print the compute dispatches and barriers recorded for each graph
     static const bool diag_count = getenv("GGML_VK_DIAG_COUNT") != nullptr;
@@ -16507,11 +16510,25 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+// number of compute dispatches recorded by the last graph_compute on this backend (used by test-backend-ops
+// to check that a fusion fires)
+static uint32_t ggml_backend_vk_last_graph_dispatches(ggml_backend_t backend) {
+    return ((ggml_backend_vk_context *) backend->context)->diag_last_graph_dispatches;
+}
+
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_vk_last_graph_dispatches") == 0) {
+        return (void *) ggml_backend_vk_last_graph_dispatches;
+    }
+    return nullptr;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {
