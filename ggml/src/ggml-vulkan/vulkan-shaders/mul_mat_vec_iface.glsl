@@ -36,3 +36,20 @@ layout (binding = 4) readonly buffer Fuse1 {D_TYPE data_fuse1[];};
 layout (binding = 5) readonly buffer IDS {int data_ids[];};
 #endif
 
+#ifdef MUL_MAT_ID_GLU
+// the up weights of a fused gate/up/GLU mat-vec, read by DA in the up pass
+layout (binding = 6) readonly buffer AUP {A_TYPE data_a_up[];};
+#if defined(A_TYPEV4)
+layout (binding = 6) readonly buffer AUPV4 {A_TYPEV4 data_a_v4_up[];};
+#endif
+#if defined(A_TYPE_PACKED16)
+layout (binding = 6) readonly buffer AUP_PACKED16 {A_TYPE_PACKED16 data_a_packed16_up[];};
+#endif
+#if defined(A_TYPE_PACKED32)
+layout (binding = 6) readonly buffer AUP_PACKED32 {A_TYPE_PACKED32 data_a_packed32_up[];};
+#endif
+#if defined(A_TYPE_PACKED64)
+layout (binding = 6) readonly buffer AUP_PACKED64 {A_TYPE_PACKED64 data_a_packed64_up[];};
+#endif
+#endif
+

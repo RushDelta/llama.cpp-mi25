@@ -1,6 +1,13 @@
 #if !defined(GGML_TYPES_COMP)
 #define GGML_TYPES_COMP
 
+// reads of the weights: the gate weights (binding 0), or in the up pass of a fused MUL_MAT_ID_GLU the up weights (binding 6)
+#ifdef MUL_MAT_ID_GLU
+#define DA(view, idx) (glu_pass != 0 ? view##_up[idx] : view[idx])
+#else
+#define DA(view, idx) view[idx]
+#endif
+
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require

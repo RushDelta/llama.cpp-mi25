@@ -79,6 +79,7 @@ struct vk_mat_vec_id_push_constants {
     uint32_t ne11;
     uint32_t expert_i1;
     uint32_t nbi1;
+    uint32_t glu_op;
 };
 
 struct vk_flash_attn_push_constants {
