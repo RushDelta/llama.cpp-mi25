@@ -1301,6 +1301,7 @@ struct ggml_backend_vk_context {
     // compute dispatches and barriers since the last graph end [GGML_VK_DIAG_COUNT]
     uint32_t diag_n_dispatches {};
     uint32_t diag_n_barriers {};
+    bool diag_skip_barriers {};  // GGML_VK_DIAG_NO_BARRIERS, set per graph
 };
 
 struct ggml_backend_vk_buffer_context {

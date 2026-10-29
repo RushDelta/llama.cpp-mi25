@@ -1150,12 +1150,10 @@ void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subctx) {
         ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
     }
 
-    // GGML_VK_DIAG_NO_BARRIERS=1: timing diagnostic only, results are WRONG. Skips the compute-queue barriers
-    // between dispatches; transfer-queue and staging-copy barriers (ctx == nullptr) are kept.
-    static const bool diag_no_barriers = getenv("GGML_VK_DIAG_NO_BARRIERS") && strcmp(getenv("GGML_VK_DIAG_NO_BARRIERS"), "1") == 0;
+    // GGML_VK_DIAG_NO_BARRIERS: skip the compute-queue barriers (see ggml_backend_vk_graph_compute)
     if (ctx && !transfer_queue) {
         ctx->diag_n_barriers++;
-        if (diag_no_barriers) {
+        if (ctx->diag_skip_barriers) {
             return;
         }
     }
@@ -14470,6 +14468,19 @@ static int32_t find_first_set(uint32_t x) {
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+
+    // GGML_VK_DIAG_NO_BARRIERS=1: timing diagnostic only, results are WRONG. Skips the compute-queue barriers between
+    // dispatches (transfer-queue and staging-copy barriers are kept) in decode graphs, i.e. graphs without a quantized
+    // weight matmul over more than one token. Prompt graphs keep them (without, prompt processing slows to ~1 t/s).
+    static const bool diag_no_barriers = getenv("GGML_VK_DIAG_NO_BARRIERS") && strcmp(getenv("GGML_VK_DIAG_NO_BARRIERS"), "1") == 0;
+    ctx->diag_skip_barriers = diag_no_barriers;
+    for (int i = 0; i < cgraph->n_nodes && ctx->diag_skip_barriers; i++) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if ((n->op == GGML_OP_MUL_MAT || n->op == GGML_OP_MUL_MAT_ID) && ggml_is_quantized(n->src[0]->type) &&
+            n->ne[n->op == GGML_OP_MUL_MAT ? 1 : 2] > 1) {
+            ctx->diag_skip_barriers = false;
+        }
+    }
 
     ctx->device->diag_cgraph = nullptr;
     ctx->device->diag_prev_start = -1;
