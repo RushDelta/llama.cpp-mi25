@@ -1314,6 +1314,8 @@ struct test_case {
 
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
+    // extra check on the tested backend after a passing whole-graph comparison (e.g. that a fusion fired)
+    virtual bool check_backend_result(ggml_backend_t backend) { GGML_UNUSED(backend); return true; }
     virtual bool use_weight_context() { return false; }
 
     ggml_cgraph * gf = nullptr;
@@ -1589,7 +1591,7 @@ struct test_case {
                                                                fused_nodes_to_verify.size());
 
         // Create test result
-        bool        test_passed = ud.ok && cmp_ok;
+        bool        test_passed = ud.ok && cmp_ok && check_backend_result(backend1);
         std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");
         test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", supported, test_passed,
                            error_msg);
@@ -7989,6 +7991,55 @@ struct test_mul_mat_vec_fusion : public test_case {
     }
 };
 
+// MoE decode: MUL_MAT_ID gate + MUL_MAT_ID up + GLU over the same broadcast input, as in Qwen3.6 experts. Spec:
+// docs/mi25-fuse-moe-glu.md. Besides the CPU comparison, on a Vulkan backend whose device has the fusion enabled
+// and for n_tokens <= the mat-vec-id threshold, the graph must run in at most n_tokens + 2 dispatches (optional Q8_1
+// quantize of the input, one fused gate/up/GLU mat-vec per token, the trailing MUL); unfused it takes 2*n_tokens + 2
+// or more (gate and up per token, GLU, MUL).
+struct test_moe_glu_fusion : public test_mul_mat_vec_fusion {
+    test_moe_glu_fusion(ggml_type type, ggml_glu_op op, int64_t m, int64_t n, int64_t k, int n_mats, int n_used)
+        : test_mul_mat_vec_fusion(type, op, m, n, k, true, n_mats, n_used, true, false, true, false, { 1, 1 }) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_GLU_FUSION";
+    }
+
+    bool check_backend_result(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        if (strcmp(ggml_backend_reg_name(reg), "Vulkan") != 0) {
+            return true;
+        }
+        const char * fuse_env = getenv("GGML_VK_FUSE_MOE_GLU");
+        if (fuse_env && strcmp(fuse_env, "0") == 0) {
+            return true;
+        }
+        const char * mmvid_env = getenv("GGML_VK_MMVID_MAX_TOKENS");
+        if (m > (mmvid_env ? atoi(mmvid_env) : 8)) {
+            return true; // tiled MUL_MAT_ID path, not fused
+        }
+        auto last_dispatches = (uint32_t (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_last_graph_dispatches");
+        auto fusion_enabled  = (bool (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_fuse_moe_glu_enabled");
+        if (!last_dispatches) {
+            printf("[MOE_GLU_FUSION] no ggml_backend_vk_last_graph_dispatches ");
+            return false;
+        }
+        const uint32_t n_dispatches = last_dispatches(backend);
+        if (!fusion_enabled) {
+            printf("[MOE_GLU_FUSION] fusion not implemented (no ggml_backend_vk_fuse_moe_glu_enabled), %u dispatches ", n_dispatches);
+            return false;
+        }
+        if (!fusion_enabled(backend)) {
+            return true; // not enabled on this device
+        }
+        if (n_dispatches > m + 2) {
+            printf("[MOE_GLU_FUSION] not fused: %u dispatches > %d ", n_dispatches, (int) m + 2);
+            return false;
+        }
+        return true;
+    }
+};
+
 // GGML_OP_SUM
 struct test_sum : public test_case {
     const ggml_type type;
@@ -12456,6 +12507,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     //        }
     //    }
     //}
+
+    // Vulkan fused MoE decode (gate + up + SWIGLU), Qwen3.6 expert shapes: 256 experts, 8 used, 2048 -> 512
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+        for (int64_t n_tokens : {1, 4, 8, 16, 64}) {
+            if (type != GGML_TYPE_Q4_K && n_tokens != 1 && n_tokens != 8) {
+                continue;
+            }
+            test_cases.emplace_back(new test_moe_glu_fusion(type, GGML_GLU_OP_SWIGLU, n_tokens, 512, 2048, 256, 8));
+        }
+    }
 
     // Both sides of the same row-count boundary as above, on the fused path.
     for (int64_t rows : {6271, 6272, 6273}) {
