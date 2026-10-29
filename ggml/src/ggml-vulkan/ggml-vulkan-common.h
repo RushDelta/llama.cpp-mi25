@@ -79,6 +79,7 @@ void ggml_vk_command_pool_cleanup(vk_device& device, vk_command_pool& p);
 void ggml_vk_queue_command_pools_cleanup(vk_device& device);
 vk_subbuffer ggml_vk_subbuffer(const ggml_backend_vk_context* ctx, const vk_buffer& buf, size_t offset = 0);
 void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subctx);
+void ggml_vk_pre_transfer(vk_context& subctx);
 void ggml_vk_set_event(vk_context& ctx, vk::Event& event);
 void ggml_vk_wait_events(vk_context& ctx, std::vector<vk::Event>&& events);
 vk_subbuffer ggml_vk_tensor_subbuffer(const ggml_backend_vk_context * ctx, const ggml_tensor * tensor, bool allow_misalign = false);

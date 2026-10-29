@@ -1141,6 +1141,15 @@ vk_subbuffer ggml_vk_subbuffer(const ggml_backend_vk_context* ctx, const vk_buff
     return { buf, offset, ggml_vk_get_max_buffer_range(ctx, buf, offset) };
 }
 
+// GGML_VK_BARRIER_MODE: access/stage masks of the compute-queue barrier emitted by ggml_vk_sync_buffers
+//   0 (default): compute+transfer stages, shader+transfer read+write access in both scopes
+//   1: same stages, only write access in the source scope (equivalent per the Vulkan spec: read bits there are no-ops)
+//   2: compute -> compute stages, shader write -> shader read+write; mode 1 masks next to transfer commands
+static int ggml_vk_barrier_mode() {
+    static const int mode = getenv("GGML_VK_BARRIER_MODE") ? atoi(getenv("GGML_VK_BARRIER_MODE")) : 0;
+    return mode;
+}
+
 void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subctx) {
     VK_LOG_DEBUG("ggml_vk_sync_buffers()");
 
@@ -1158,17 +1167,42 @@ void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subctx) {
         }
     }
 
-    subctx->s->buffer->buf.pipelineBarrier(
-        subctx->p->q->stage_flags,
-        subctx->p->q->stage_flags,
-        {},
-        { {
-          { !transfer_queue ? (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) : (vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) },
-          { !transfer_queue ? (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) : (vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) }
-        } },
-        {},
-        {}
-    );
+    const int mode = ggml_vk_barrier_mode();
+    if (transfer_queue || mode == 0) {
+        subctx->s->buffer->buf.pipelineBarrier(
+            subctx->p->q->stage_flags,
+            subctx->p->q->stage_flags,
+            {},
+            { {
+              { !transfer_queue ? (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) : (vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) },
+              { !transfer_queue ? (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) : (vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) }
+            } },
+            {},
+            {}
+        );
+        return;
+    }
+
+    // mode 2: compute-only barrier, unless this is a staging-copy path (ctx == nullptr) or a transfer command was
+    // recorded since the last barrier (its writes need the transfer stage in the source scope)
+    const bool narrow = mode == 2 && ctx && !subctx->transfer_pending;
+    subctx->transfer_pending = false;
+    const vk::PipelineStageFlags stages = narrow ? vk::PipelineStageFlags(vk::PipelineStageFlagBits::eComputeShader) : subctx->p->q->stage_flags;
+    const vk::AccessFlags src_access = narrow ? vk::AccessFlagBits::eShaderWrite : (vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite);
+    const vk::AccessFlags dst_access = narrow ? (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite) :
+        (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite);
+    subctx->s->buffer->buf.pipelineBarrier(stages, stages, {}, { { src_access, dst_access } }, {}, {});
+}
+
+// Call before recording a transfer command (copy/fill) on a compute-queue context. With GGML_VK_BARRIER_MODE=2 the
+// barriers between dispatches leave the transfer stage out, so this adds a full barrier in front of the transfer
+// (earlier shader writes -> transfer) and makes the next barrier a full one (transfer writes -> later commands).
+void ggml_vk_pre_transfer(vk_context& subctx) {
+    if (ggml_vk_barrier_mode() != 2 || subctx->p->q->transfer_only) {
+        return;
+    }
+    ggml_vk_sync_buffers(nullptr, subctx);
+    subctx->transfer_pending = true;
 }
 
 static void ggml_vk_reset_event(vk_context& ctx, vk::Event& event) {
@@ -7760,6 +7794,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
             if (y_needs_k_padding) {
                 GGML_ASSERT(y_sz % 4 == 0);
                 // Zero B padding because clamping only A can produce 0 * Inf or NaN.
+                ggml_vk_pre_transfer(subctx);
                 subctx->s->buffer->buf.fillBuffer(d_Y->buffer, 0, y_sz, 0);
                 ggml_vk_sync_buffers(ctx, subctx);
                 const ggml_tensor y_staged_dst = make_y_staged_dst();
@@ -13498,6 +13533,7 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
             }
         }
 
+        ggml_vk_pre_transfer(cpy_ctx);
         cpy_ctx->s->buffer->buf.copyBuffer(ctx->sync_staging->buffer, buf->buffer, slices);
 
         if (size == stride_data) {
@@ -13554,6 +13590,7 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
             }
         }
 
+        ggml_vk_pre_transfer(compute_ctx);
         compute_ctx->s->buffer->buf.copyBuffer(buf->buffer, ctx->sync_staging->buffer, slices);
 
         if (size == stride_data) {

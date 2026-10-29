@@ -1130,6 +1130,8 @@ struct vk_context_struct {
     std::vector<std::string> debug_labels;
 
     vk_command_pool * p {};
+
+    bool transfer_pending {};  // GGML_VK_BARRIER_MODE=2: a transfer command was recorded since the last barrier
 };
 
 typedef std::shared_ptr<vk_context_struct> vk_context;

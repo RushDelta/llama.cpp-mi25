@@ -462,6 +462,7 @@ static void ggml_vk_buffer_write_nc_async(ggml_backend_vk_context * ctx, vk_cont
         }
 
         ggml_vk_sync_buffers(ctx, subctx);
+        ggml_vk_pre_transfer(subctx);
         subctx->s->buffer->buf.copyBuffer(buf->buffer, dst->buffer, slices);
         return;
     }
@@ -477,6 +478,7 @@ static void ggml_vk_buffer_write_nc_async(ggml_backend_vk_context * ctx, vk_cont
     VkBufferCopy buf_copy{ 0, offset, copy_size };
 
     ggml_vk_sync_buffers(ctx, subctx);
+    ggml_vk_pre_transfer(subctx);
     vkCmdCopyBuffer(subctx->s->buffer->buf, (VkBuffer)staging->buffer, (VkBuffer)dst->buffer, 1, &buf_copy);
 
     for (uint64_t i3 = 0; i3 < ne3; i3++) {
@@ -526,6 +528,7 @@ bool ggml_vk_buffer_write_2d_async(vk_context subctx, vk_buffer& dst, size_t off
         }
 
         ggml_vk_sync_buffers(nullptr, subctx);
+        ggml_vk_pre_transfer(subctx);
         subctx->s->buffer->buf.copyBuffer(buf->buffer, dst->buffer, slices);
         return true;
     }
@@ -557,6 +560,7 @@ bool ggml_vk_buffer_write_2d_async(vk_context subctx, vk_buffer& dst, size_t off
     }
 
     ggml_vk_sync_buffers(nullptr, subctx);
+    ggml_vk_pre_transfer(subctx);
     subctx->s->buffer->buf.copyBuffer(staging_buffer->buffer, dst->buffer, slices);
 
     if (width == spitch) {
@@ -647,6 +651,7 @@ bool ggml_vk_buffer_read_2d_async(vk_context subctx, vk_buffer& src, size_t offs
     if (buf != nullptr) {
         // Memory is pinned, use as staging buffer
         ggml_vk_sync_buffers(nullptr, subctx);
+        ggml_vk_pre_transfer(subctx);
         subctx->s->buffer->buf.copyBuffer(src->buffer, buf->buffer, slices);
 
         return true;
@@ -679,6 +684,7 @@ bool ggml_vk_buffer_read_2d_async(vk_context subctx, vk_buffer& src, size_t offs
     }
 
     ggml_vk_sync_buffers(nullptr, subctx);
+    ggml_vk_pre_transfer(subctx);
     subctx->s->buffer->buf.copyBuffer(src->buffer, staging_buffer->buffer, staging_slices);
 
     if (width == dpitch) {
@@ -763,6 +769,7 @@ void ggml_vk_buffer_copy_async(vk_context& ctx, vk_buffer& dst, size_t dst_offse
 
     VkBufferCopy bc{ src_offset, dst_offset, size };
 
+    ggml_vk_pre_transfer(ctx);
     vkCmdCopyBuffer(ctx->s->buffer->buf, (VkBuffer)src->buffer, (VkBuffer)dst->buffer, 1, &bc);
 }
 
@@ -801,6 +808,7 @@ void ggml_vk_buffer_memset_async(vk_context& ctx, vk_buffer& dst, size_t offset,
     }
 
     // Fall back to GPU fillBuffer for non-UMA or non-host-visible buffers
+    ggml_vk_pre_transfer(ctx);
     ctx->s->buffer->buf.fillBuffer(dst->buffer, offset, size, c);
 }
 
@@ -816,6 +824,7 @@ void ggml_vk_buffer_memset(vk_buffer& dst, size_t offset, uint32_t c, size_t siz
     std::lock_guard<std::recursive_mutex> guard(dst->device->mutex);
     vk_context subctx = ggml_vk_create_temporary_context(dst->device->transfer_queue->cmd_pool);
     ggml_vk_ctx_begin(dst->device, subctx);
+    ggml_vk_pre_transfer(subctx);
     subctx->s->buffer->buf.fillBuffer(dst->buffer, offset, size, c);
     ggml_vk_ctx_end(subctx);
 
