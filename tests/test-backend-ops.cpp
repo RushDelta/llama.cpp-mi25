@@ -7997,8 +7997,9 @@ struct test_mul_mat_vec_fusion : public test_case {
 // quantize of the input, one fused gate/up/GLU mat-vec per token, the trailing MUL); unfused it takes 2*n_tokens + 2
 // or more (gate and up per token, GLU, MUL).
 struct test_moe_glu_fusion : public test_mul_mat_vec_fusion {
-    test_moe_glu_fusion(ggml_type type, ggml_glu_op op, int64_t m, int64_t n, int64_t k, int n_mats, int n_used)
-        : test_mul_mat_vec_fusion(type, op, m, n, k, true, n_mats, n_used, true, false, true, false, { 1, 1 }) {}
+    test_moe_glu_fusion(ggml_type type, ggml_glu_op op, int64_t m, int64_t n, int64_t k, int n_mats, int n_used,
+                        bool b = true, bool skip = false)
+        : test_mul_mat_vec_fusion(type, op, m, n, k, true, n_mats, n_used, b, false, true, false, { 1, 1 }, skip) {}
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -8038,6 +8039,38 @@ struct test_moe_glu_fusion : public test_mul_mat_vec_fusion {
         }
         return true;
     }
+};
+
+// Op-level timing of L chained MoE gate/up/GLU layers (Qwen3.6 expert shapes). Each layer has its own ids, and
+// the next layer's input is a view of this layer's GLU output, so each layer depends on the previous one as in a model.
+// op_flops is inflated so that eval_perf does not duplicate the output node; us/run is the time of all L layers.
+struct test_moe_glu_perf : public test_case {
+    const ggml_type type;
+    const int64_t m, n, k;
+    const int n_mats, n_used, n_layers;
+    test_moe_glu_perf(ggml_type type, int64_t m, int64_t n = 512, int64_t k = 2048, int n_mats = 256, int n_used = 8, int n_layers = 16)
+        : type(type), m(m), n(n), k(k), n_mats(n_mats), n_used(n_used), n_layers(n_layers) {}
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MOE_GLU_PERF"; }
+    std::string vars() override { return VARS_TO_STR7(type, m, n, k, n_mats, n_used, n_layers); }
+    uint64_t op_flops(ggml_tensor * t) override { GGML_UNUSED(t); return 1000ull * 1000 * 1000 * 1000; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        GGML_ASSERT(n * n_used >= k);
+        ggml_tensor * gates = ggml_new_tensor_3d(ctx, type, k, n, n_mats);
+        ggml_tensor * ups   = ggml_new_tensor_3d(ctx, type, k, n, n_mats);
+        ggml_tensor * x     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, m);
+        ggml_tensor * out   = nullptr;
+        for (int l = 0; l < n_layers; ++l) {
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, m);
+            ids = ggml_view_2d(ctx, ids, n_used, m, ids->nb[1], 0);
+            ggml_tensor * g = ggml_mul_mat_id(ctx, gates, x, ids);
+            ggml_tensor * u = ggml_mul_mat_id(ctx, ups, x, ids);
+            out = ggml_swiglu_split(ctx, g, u);
+            x = ggml_view_3d(ctx, out, k, 1, m, k*sizeof(float), out->nb[2], 0);
+        }
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override { init_mul_mat_id_tensors(ctx, n_mats); }
+    void reinit_perf_iter(ggml_context * ctx) override { init_mul_mat_id_ids(ctx, n_mats); }
 };
 
 // GGML_OP_SUM
@@ -12517,6 +12550,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_moe_glu_fusion(type, GGML_GLU_OP_SWIGLU, n_tokens, 512, 2048, 256, 8));
         }
     }
+    // PROBE (review): GEGLU, skipped ids, non-broadcast input, odd row counts, a short K
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+        for (int64_t n_tokens : {1, 4}) {
+            test_cases.emplace_back(new test_moe_glu_fusion(type, GGML_GLU_OP_GEGLU, n_tokens, 512, 2048, 256, 8));
+            test_cases.emplace_back(new test_moe_glu_fusion(type, GGML_GLU_OP_SWIGLU, n_tokens, 512, 2048, 256, 8, true, true));
+            test_cases.emplace_back(new test_moe_glu_fusion(type, GGML_GLU_OP_SWIGLU, n_tokens, 512, 2048, 256, 8, false, false));
+            test_cases.emplace_back(new test_moe_glu_fusion(type, GGML_GLU_OP_SWIGLU, n_tokens, 513, 2048, 256, 8));
+            test_cases.emplace_back(new test_moe_glu_fusion(type, GGML_GLU_OP_SWIGLU, n_tokens, 7, 256, 16, 8));
+            test_cases.emplace_back(new test_moe_glu_fusion(type, GGML_GLU_OP_GEGLU, n_tokens, 3, 256, 16, 16, false, true));
+        }
+    }
 
     // Both sides of the same row-count boundary as above, on the fused path.
     for (int64_t rows : {6271, 6272, 6273}) {
@@ -12672,6 +12716,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // fused MoE gate/up/GLU decode (Vulkan), Qwen3.6 expert shapes, 16 chained layers
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        for (int64_t m : {1, 4, 16}) {
+            test_cases.emplace_back(new test_moe_glu_perf(type, m));
+        }
+    }
 
     // delta-net conv input: conv state followed by the transposed qkv of the ubatch
     test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 8192, 1, 1}, 512, 0, 16));
