@@ -14,11 +14,11 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint v_im, 
 
     [[unroll]] for (uint n = 0; n < num_rows; ++n) {
         const uint ib0 = a_offset + (first_row+n)*num_blocks_per_row;
-        const FLOAT_TYPEV2 dm = FLOAT_TYPEV2(data_a[ib0 + i].dm);
+        const FLOAT_TYPEV2 dm = FLOAT_TYPEV2(DA(data_a, ib0 + i).dm);
 
-        const uint32_t scale0_u32 = data_a_packed16[ib0 + i].scales[v_im    ];
-        const uint32_t scale4_u32 = data_a_packed16[ib0 + i].scales[v_im + 2];
-        const uint32_t scale8_u32 = data_a_packed16[ib0 + i].scales[v_im + 4];
+        const uint32_t scale0_u32 = DA(data_a_packed16, ib0 + i).scales[v_im    ];
+        const uint32_t scale4_u32 = DA(data_a_packed16, ib0 + i).scales[v_im + 2];
+        const uint32_t scale8_u32 = DA(data_a_packed16, ib0 + i).scales[v_im + 4];
 
         const uint32_t scale_0_4_l = (scale4_u32 << 16) | scale0_u32;
         const uint32_t scale_0_4_h = (scale_0_4_l & 0xC0C0C0C0) >> 2;
@@ -34,15 +34,15 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint v_im, 
         const FLOAT_TYPE sc6 = scale8_f.z;
         const FLOAT_TYPE sc7 = scale8_f.w;
 
-        const uint32_t qs0_16_u32 = uint32_t(data_a_packed16[ib0 + i].qs[q_offset / 2]) | (uint32_t(data_a_packed16[ib0 + i].qs[q_offset / 2 + 8]) << 16);
-        const uint32_t qs64_80_u32 = uint32_t(data_a_packed16[ib0 + i].qs[q_offset / 2 + 32]) | (uint32_t(data_a_packed16[ib0 + i].qs[q_offset / 2 + 40]) << 16);
+        const uint32_t qs0_16_u32 = uint32_t(DA(data_a_packed16, ib0 + i).qs[q_offset / 2]) | (uint32_t(DA(data_a_packed16, ib0 + i).qs[q_offset / 2 + 8]) << 16);
+        const uint32_t qs64_80_u32 = uint32_t(DA(data_a_packed16, ib0 + i).qs[q_offset / 2 + 32]) | (uint32_t(DA(data_a_packed16, ib0 + i).qs[q_offset / 2 + 40]) << 16);
 
         uint32_t qs0_16_u32_lo4 = qs0_16_u32 & 0x0F0F0F0F;
         uint32_t qs0_16_u32_hi4 = (qs0_16_u32 >> 4) & 0x0F0F0F0F;
         uint32_t qs64_80_u32_lo4 = qs64_80_u32 & 0x0F0F0F0F;
         uint32_t qs64_80_u32_hi4 = (qs64_80_u32 >> 4) & 0x0F0F0F0F;
 
-        const uint32_t qh = pack32(u16vec2(data_a_packed16[ib0 + i].qh[l0 / 2], data_a_packed16[ib0 + i].qh[l0 / 2 + 8]));
+        const uint32_t qh = pack32(u16vec2(DA(data_a_packed16, ib0 + i).qh[l0 / 2], DA(data_a_packed16, ib0 + i).qh[l0 / 2 + 8]));
 
         const uint32_t qs0_16_lo4_offset16 = ((qh >> (2*v_im)) & 0x01010101) << 4;
         const uint32_t qs0_16_hi4_offset16 = ((qh >> (2*v_im)) & 0x02020202) << 3;
@@ -155,11 +155,11 @@ void main() {
 
     // do NUM_ROWS at a time, unless there aren't enough remaining rows
     if (first_row + NUM_ROWS <= p.stride_d) {
-        compute_outputs(first_row, NUM_ROWS);
+        compute_rows(first_row, NUM_ROWS);
     } else {
         if (first_row >= p.stride_d) {
             return;
         }
-        compute_outputs(first_row, p.stride_d - first_row);
+        compute_rows(first_row, p.stride_d - first_row);
     }
 }

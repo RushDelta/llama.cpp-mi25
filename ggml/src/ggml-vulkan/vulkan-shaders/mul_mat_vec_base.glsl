@@ -31,6 +31,7 @@ layout (push_constant) uniform parameter
     uint ne11;
     uint expert_i1;
     uint nbi1;
+    uint glu_op;
 #else
     uint base_work_group_y;
     uint ne02;
@@ -43,6 +44,10 @@ layout (push_constant) uniform parameter
 #ifdef MUL_MAT_ID
 uint expert_id;
 bool expert_skip; // an id of -1 skips the slot, the result row is zeroed
+#endif
+
+#ifdef MUL_MAT_ID_GLU
+uint glu_pass; // 0: gate weights, 1: up weights (see compute_rows)
 #endif
 
 void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
@@ -93,6 +98,47 @@ layout (constant_id = 0) const uint BLOCK_SIZE = 32;
 layout (constant_id = 1) const uint NUM_ROWS = 1;
 layout (constant_id = 2) const uint NUM_COLS = 1;
 
+#ifdef MUL_MAT_ID_GLU
+FLOAT_TYPE glu_gate[NUM_COLS][NUM_ROWS];
+#endif
+
+#ifdef MUL_MAT_ID_GLU
+// D = act(gate) * up with SWIGLU (glu_op 1) or GEGLU (glu_op 2), the same formulas as swiglu.comp and geglu.comp
+void store_output(const uint j, const uint n, const uint32_t idx, const FLOAT_TYPE v) {
+    if (glu_pass == 0) {
+        glu_gate[j][n] = v;
+        return;
+    }
+    const FLOAT_TYPE g = glu_gate[j][n];
+    FLOAT_TYPE act;
+    if (p.glu_op == 2) {
+        const FLOAT_TYPE val = FLOAT_TYPE(0.79788456080286535587989211986876) * g * (FLOAT_TYPE(1) + FLOAT_TYPE(0.044715) * g * g);
+        act = FLOAT_TYPE(0.5) * g * (FLOAT_TYPE(2) - FLOAT_TYPE(2) / (exp(FLOAT_TYPE(2) * val) + FLOAT_TYPE(1)));
+    } else {
+        act = g / (FLOAT_TYPE(1) + exp(-g));
+    }
+    data_d[idx] = D_TYPE(act * v);
+}
+
+// the gate and up sums of a fused MUL_MAT_ID_GLU row are computed by the same workgroup, one after the other
+void compute_outputs(const uint32_t first_row, const uint32_t num_rows);
+
+void compute_rows(const uint32_t first_row, const uint32_t num_rows) {
+    glu_pass = 0;
+    compute_outputs(first_row, num_rows);
+    // the up reduction reuses the shared memory of the gate reduction
+    barrier();
+    glu_pass = 1;
+    compute_outputs(first_row, num_rows);
+}
+#else
+void store_output(const uint j, const uint n, const uint32_t idx, const FLOAT_TYPE v) {
+    data_d[idx] = D_TYPE(v);
+}
+
+#define compute_rows compute_outputs
+#endif
+
 #ifdef USE_SUBGROUP_ADD_NO_SHMEM
 void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offset, const in uint32_t first_row, const in uint32_t num_rows, const in uint32_t tid) {
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
@@ -127,7 +173,7 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
 #endif
-                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
+                store_output(j, n, j*p.batch_stride_d + d_offset + first_row + n, temp[j][n]);
             }
         }
     }
@@ -185,7 +231,7 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
 #endif
-                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
+                store_output(j, n, j*p.batch_stride_d + d_offset + first_row + n, temp[j][n]);
             }
         }
     }
@@ -233,7 +279,7 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                     tmpsh[j][n][0] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
 #endif
-                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(tmpsh[j][n][0]);
+                store_output(j, n, j*p.batch_stride_d + d_offset + first_row + n, tmpsh[j][n][0]);
             }
         }
     }
