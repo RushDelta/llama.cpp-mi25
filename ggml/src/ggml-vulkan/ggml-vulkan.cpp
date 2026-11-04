@@ -5042,7 +5042,7 @@ vk_device ggml_vk_get_device(size_t idx) {
 
         const char * fuse_moe_glu_env = getenv("GGML_VK_FUSE_MOE_GLU");
         device->fuse_moe_glu = !device->disable_fusion &&
-                               (fuse_moe_glu_env ? strcmp(fuse_moe_glu_env, "0") != 0 : device->architecture == vk_device_architecture::AMD_GCN);
+                               (fuse_moe_glu_env ? strcmp(fuse_moe_glu_env, "0") != 0 : false);  // opt-in: +0.2% in-model, below the ship bar
 
         device->disable_descriptor_reuse = getenv("GGML_VK_DISABLE_DESCRIPTOR_REUSE") != nullptr;
 
